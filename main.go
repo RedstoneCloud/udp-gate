@@ -26,14 +26,14 @@ type pkt struct {
 }
 
 type proxy struct {
-	conn        *net.UDPConn
-	rdb         *redis.Client
-	backendKey  string
-	sessions    map[string]*session
-	sessionsMu  sync.RWMutex
-	idleTimeout time.Duration
-	queue       chan pkt
-	bufPool     sync.Pool
+	conn       *net.UDPConn
+	rdb        *redis.Client
+	backendKey string
+	sessions   map[string]*session
+	sessionsMu sync.RWMutex
+	idleSecs   int
+	queue      chan pkt
+	bufPool    sync.Pool
 }
 
 func main() {
@@ -69,12 +69,12 @@ func main() {
 	log.Printf("connected to Redis at %s", redisAddr)
 
 	p := &proxy{
-		conn:        conn,
-		rdb:         rdb,
-		backendKey:  backendKey,
-		sessions:    make(map[string]*session),
-		idleTimeout: time.Duration(idleSecs) * time.Second,
-		queue:       make(chan pkt, queueSize),
+		conn:       conn,
+		rdb:        rdb,
+		backendKey: backendKey,
+		sessions:   make(map[string]*session),
+		idleSecs:   idleSecs,
+		queue:      make(chan pkt, queueSize),
 		bufPool: sync.Pool{
 			New: func() any {
 				b := make([]byte, 64*1024)
@@ -194,10 +194,11 @@ func (p *proxy) subscribeDisconnects(ctx context.Context, channel string) {
 }
 
 func (p *proxy) reapIdleSessions() {
-	ticker := time.NewTicker((p.idleTimeout / 2) * time.Second)
+	ticker := time.NewTicker(time.Duration(p.idleSecs/2) * time.Second)
+	removalTime := -time.Duration(p.idleSecs) * time.Second
 	defer ticker.Stop()
 	for range ticker.C {
-		cutoffNano := time.Now().Add(-p.idleTimeout).UnixNano()
+		cutoffNano := time.Now().Add(removalTime).UnixNano()
 
 		p.sessionsMu.RLock()
 		var idle []string
