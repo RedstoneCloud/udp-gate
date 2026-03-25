@@ -26,14 +26,15 @@ type pkt struct {
 }
 
 type proxy struct {
-	conn       *net.UDPConn
-	rdb        *redis.Client
-	backendKey string
-	sessions   map[string]*session
-	sessionsMu sync.RWMutex
-	idleSecs   int
-	queue      chan pkt
-	bufPool    sync.Pool
+	conn         *net.UDPConn
+	rdb          *redis.Client
+	backendKey   string
+	sessions     map[string]*session
+	portToClient map[string]string
+	sessionsMu   sync.RWMutex
+	idleSecs     int
+	queue        chan pkt
+	bufPool      sync.Pool
 }
 
 func main() {
@@ -69,10 +70,11 @@ func main() {
 	log.Printf("connected to Redis at %s", redisAddr)
 
 	p := &proxy{
-		conn:       conn,
-		rdb:        rdb,
-		backendKey: backendKey,
-		sessions:   make(map[string]*session),
+		conn:         conn,
+		rdb:          rdb,
+		backendKey:   backendKey,
+		sessions:     make(map[string]*session),
+		portToClient: make(map[string]string),
 		idleSecs:   idleSecs,
 		queue:      make(chan pkt, queueSize),
 		bufPool: sync.Pool{
@@ -154,7 +156,9 @@ func (p *proxy) handlePacket(ctx context.Context, clientAddr *net.UDPAddr, data 
 			sess = existing
 		} else {
 			p.sessions[key] = sess
-			log.Printf("new session: %s → %s", key, backendAddr)
+			port := strconv.Itoa(upstream.LocalAddr().(*net.UDPAddr).Port)
+			p.portToClient[port] = key
+			log.Printf("new session: %s → %s (backend port %s)", key, backendAddr, port)
 			go p.forwardReplies(clientAddr, sess)
 		}
 		p.sessionsMu.Unlock()
@@ -188,8 +192,16 @@ func (p *proxy) subscribeDisconnects(ctx context.Context, channel string) {
 	defer sub.Close()
 	log.Printf("subscribed to Redis channel %q for disconnect events", channel)
 	for msg := range sub.Channel() {
-		log.Printf("disconnect event for %s", msg.Payload)
-		p.removeSession(msg.Payload)
+		port := msg.Payload
+		p.sessionsMu.RLock()
+		key, ok := p.portToClient[port]
+		p.sessionsMu.RUnlock()
+		if !ok {
+			log.Printf("disconnect event for unknown port %s", port)
+			continue
+		}
+		log.Printf("disconnect event for port %s (%s)", port, key)
+		p.removeSession(key)
 	}
 }
 
@@ -220,6 +232,8 @@ func (p *proxy) removeSession(key string) {
 	p.sessionsMu.Lock()
 	defer p.sessionsMu.Unlock()
 	if sess, ok := p.sessions[key]; ok {
+		port := strconv.Itoa(sess.backend.LocalAddr().(*net.UDPAddr).Port)
+		delete(p.portToClient, port)
 		sess.backend.Close()
 		delete(p.sessions, key)
 		log.Printf("session removed: %s", key)
