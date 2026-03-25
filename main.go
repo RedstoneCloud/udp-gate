@@ -13,16 +13,19 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/net/ipv4"
 )
+
+const bufSize = 64 * 1024
 
 type session struct {
 	backend  *net.UDPConn
+	port     int
 	lastSeen atomic.Int64
 }
 
-type pkt struct {
-	addr *net.UDPAddr
-	data []byte
+func (s *session) touch() {
+	s.lastSeen.Store(time.Now().UnixNano())
 }
 
 type proxy struct {
@@ -30,11 +33,10 @@ type proxy struct {
 	rdb          *redis.Client
 	backendKey   string
 	sessions     map[string]*session
-	portToClient map[string]string
+	portToClient map[int]string
 	sessionsMu   sync.RWMutex
-	idleSecs     int
-	queue        chan pkt
-	bufPool      sync.Pool
+	idleTimeout  time.Duration
+	batchSize    int
 }
 
 func main() {
@@ -48,15 +50,9 @@ func main() {
 	redisDB := envInt("REDIS_DB", 0)
 	backendKey := env("REDIS_BACKEND_KEY", "udp_gate:backend")
 	disconnectChannel := env("REDIS_DISCONNECT_CHANNEL", "udp_gate:disconnect")
-	idleSecs := envInt("SESSION_IDLE_TIMEOUT_SECS", 60)
-	workers := envInt("WORKER_COUNT", runtime.GOMAXPROCS(0)*2)
-	queueSize := envInt("QUEUE_SIZE", 4096)
-
-	laddr, err := net.ResolveUDPAddr("udp", proxyAddr)
-	must(err, "resolve listen addr")
-	conn, err := net.ListenUDP("udp", laddr)
-	must(err, "listen UDP")
-	log.Printf("UDP proxy listening on %s (%d workers, queue %d)", proxyAddr, workers, queueSize)
+	idleTimeout := time.Duration(envInt("SESSION_IDLE_TIMEOUT_SECS", 60)) * time.Second
+	listeners := envInt("LISTENER_COUNT", runtime.GOMAXPROCS(0))
+	batchSize := envInt("BATCH_SIZE", 64)
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisAddr,
@@ -69,55 +65,48 @@ func main() {
 	}
 	log.Printf("connected to Redis at %s", redisAddr)
 
+	conns := make([]*net.UDPConn, listeners)
+	for i := range conns {
+		conn, err := listenUDP(proxyAddr)
+		must(err, "listen UDP")
+		conns[i] = conn
+	}
+	log.Printf("UDP proxy listening on %s (%d listeners, batch size %d)", proxyAddr, listeners, batchSize)
+
 	p := &proxy{
-		conn:         conn,
+		conn:         conns[0],
 		rdb:          rdb,
 		backendKey:   backendKey,
 		sessions:     make(map[string]*session),
-		portToClient: make(map[string]string),
-		idleSecs:   idleSecs,
-		queue:      make(chan pkt, queueSize),
-		bufPool: sync.Pool{
-			New: func() any {
-				b := make([]byte, 64*1024)
-				return &b
-			},
-		},
+		portToClient: make(map[int]string),
+		idleTimeout:  idleTimeout,
+		batchSize:    batchSize,
 	}
 
-	for i := 0; i < workers; i++ {
-		go p.worker(ctx)
+	for _, conn := range conns {
+		go p.readLoop(ctx, conn)
 	}
 	go p.subscribeDisconnects(ctx, disconnectChannel)
 	go p.reapIdleSessions()
-	p.serve()
+
+	select {}
 }
 
-func (p *proxy) serve() {
+func (p *proxy) readLoop(ctx context.Context, conn *net.UDPConn) {
+	pc := ipv4.NewPacketConn(conn)
+	msgs := make([]ipv4.Message, p.batchSize)
+	for i := range msgs {
+		msgs[i].Buffers = [][]byte{make([]byte, bufSize)}
+	}
 	for {
-		bufp := p.bufPool.Get().(*[]byte)
-		n, addr, err := p.conn.ReadFromUDP(*bufp)
+		n, err := pc.ReadBatch(msgs, 0)
 		if err != nil {
-			p.bufPool.Put(bufp)
 			log.Printf("read error: %v", err)
 			continue
 		}
-
-		data := make([]byte, n)
-		copy(data, (*bufp)[:n])
-		p.bufPool.Put(bufp)
-
-		select {
-		case p.queue <- pkt{addr, data}:
-		default:
-			log.Printf("queue full, dropping packet from %s", addr)
+		for i := 0; i < n; i++ {
+			p.handlePacket(ctx, msgs[i].Addr.(*net.UDPAddr), msgs[i].Buffers[0][:msgs[i].N])
 		}
-	}
-}
-
-func (p *proxy) worker(ctx context.Context) {
-	for pk := range p.queue {
-		p.handlePacket(ctx, pk.addr, pk.data)
 	}
 }
 
@@ -147,8 +136,8 @@ func (p *proxy) handlePacket(ctx context.Context, clientAddr *net.UDPAddr, data 
 			return
 		}
 
-		sess = &session{backend: upstream}
-		sess.lastSeen.Store(time.Now().UnixNano())
+		port := upstream.LocalAddr().(*net.UDPAddr).Port
+		sess = &session{backend: upstream, port: port}
 
 		p.sessionsMu.Lock()
 		if existing, exists := p.sessions[key]; exists {
@@ -156,15 +145,14 @@ func (p *proxy) handlePacket(ctx context.Context, clientAddr *net.UDPAddr, data 
 			sess = existing
 		} else {
 			p.sessions[key] = sess
-			port := strconv.Itoa(upstream.LocalAddr().(*net.UDPAddr).Port)
 			p.portToClient[port] = key
-			log.Printf("new session: %s → %s (backend port %s)", key, backendAddr, port)
+			log.Printf("new session: %s → %s (backend port %d)", key, backendAddr, port)
 			go p.forwardReplies(clientAddr, sess)
 		}
 		p.sessionsMu.Unlock()
 	}
 
-	sess.lastSeen.Store(time.Now().UnixNano())
+	sess.touch()
 
 	if _, err := sess.backend.Write(data); err != nil {
 		log.Printf("write to backend for %s: %v", key, err)
@@ -173,13 +161,14 @@ func (p *proxy) handlePacket(ctx context.Context, clientAddr *net.UDPAddr, data 
 }
 
 func (p *proxy) forwardReplies(clientAddr *net.UDPAddr, sess *session) {
-	buf := make([]byte, 64*1024)
+	defer p.removeSession(clientAddr.String())
+	buf := make([]byte, bufSize)
 	for {
 		n, err := sess.backend.Read(buf)
 		if err != nil {
 			return
 		}
-		sess.lastSeen.Store(time.Now().UnixNano())
+		sess.touch()
 		if _, err := p.conn.WriteToUDP(buf[:n], clientAddr); err != nil {
 			log.Printf("write to client %s: %v", clientAddr, err)
 			return
@@ -192,25 +181,28 @@ func (p *proxy) subscribeDisconnects(ctx context.Context, channel string) {
 	defer sub.Close()
 	log.Printf("subscribed to Redis channel %q for disconnect events", channel)
 	for msg := range sub.Channel() {
-		port := msg.Payload
+		port, err := strconv.Atoi(msg.Payload)
+		if err != nil {
+			log.Printf("disconnect event with invalid port %q", msg.Payload)
+			continue
+		}
 		p.sessionsMu.RLock()
 		key, ok := p.portToClient[port]
 		p.sessionsMu.RUnlock()
 		if !ok {
-			log.Printf("disconnect event for unknown port %s", port)
+			log.Printf("disconnect event for unknown port %d", port)
 			continue
 		}
-		log.Printf("disconnect event for port %s (%s)", port, key)
+		log.Printf("disconnect event for port %d (%s)", port, key)
 		p.removeSession(key)
 	}
 }
 
 func (p *proxy) reapIdleSessions() {
-	ticker := time.NewTicker(time.Duration(p.idleSecs/2) * time.Second)
-	removalTime := -time.Duration(p.idleSecs) * time.Second
+	ticker := time.NewTicker(p.idleTimeout / 2)
 	defer ticker.Stop()
 	for range ticker.C {
-		cutoffNano := time.Now().Add(removalTime).UnixNano()
+		cutoffNano := time.Now().Add(-p.idleTimeout).UnixNano()
 
 		p.sessionsMu.RLock()
 		var idle []string
@@ -232,8 +224,7 @@ func (p *proxy) removeSession(key string) {
 	p.sessionsMu.Lock()
 	defer p.sessionsMu.Unlock()
 	if sess, ok := p.sessions[key]; ok {
-		port := strconv.Itoa(sess.backend.LocalAddr().(*net.UDPAddr).Port)
-		delete(p.portToClient, port)
+		delete(p.portToClient, sess.port)
 		sess.backend.Close()
 		delete(p.sessions, key)
 		log.Printf("session removed: %s", key)
